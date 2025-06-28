@@ -125,7 +125,7 @@ impl ModelClient {
 
         let base_url = self.provider.base_url.clone();
         let base_url = base_url.trim_end_matches('/');
-        let url = format!("{}/responses", base_url);
+        let url = format!("{base_url}/responses");
         trace!("POST to {url}: {}", serde_json::to_string(&payload)?);
 
         let mut attempt = 0;
