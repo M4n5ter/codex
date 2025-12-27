@@ -5,6 +5,7 @@ use crate::telemetry::SseTelemetry;
 use codex_client::StreamResponse;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ReasoningItemContent;
+use codex_protocol::models::ReasoningSource;
 use codex_protocol::models::ResponseItem;
 use eventsource_stream::Eventsource;
 use futures::Stream;
@@ -122,17 +123,37 @@ pub async fn process_chat_sse<S>(
 
         for choice in choices {
             if let Some(delta) = choice.get("delta") {
-                if let Some(reasoning) = delta.get("reasoning") {
-                    if let Some(text) = reasoning.as_str() {
-                        append_reasoning_text(&tx_event, &mut reasoning_item, text.to_string())
-                            .await;
-                    } else if let Some(text) = reasoning.get("text").and_then(|v| v.as_str()) {
-                        append_reasoning_text(&tx_event, &mut reasoning_item, text.to_string())
-                            .await;
-                    } else if let Some(text) = reasoning.get("content").and_then(|v| v.as_str()) {
-                        append_reasoning_text(&tx_event, &mut reasoning_item, text.to_string())
-                            .await;
-                    }
+                if let Some(reasoning) = delta.get("reasoning")
+                    && let Some(text) = extract_reasoning_text(reasoning)
+                {
+                    append_reasoning_text(
+                        &tx_event,
+                        &mut reasoning_item,
+                        text,
+                        ReasoningSource::Reasoning,
+                    )
+                    .await;
+                }
+
+                if let Some(reasoning_content) = delta.get("reasoning_content")
+                    && let Some(text) = extract_reasoning_text(reasoning_content)
+                {
+                    append_reasoning_text(
+                        &tx_event,
+                        &mut reasoning_item,
+                        text,
+                        ReasoningSource::ReasoningContent,
+                    )
+                    .await;
+                }
+
+                if let Some(reasoning_details) = delta.get("reasoning_details") {
+                    append_reasoning_details(
+                        &tx_event,
+                        &mut reasoning_item,
+                        reasoning_details.clone(),
+                    )
+                    .await;
                 }
 
                 if let Some(content) = delta.get("content") {
@@ -208,16 +229,44 @@ pub async fn process_chat_sse<S>(
                 }
             }
 
-            if let Some(message) = choice.get("message")
-                && let Some(reasoning) = message.get("reasoning")
-            {
-                if let Some(text) = reasoning.as_str() {
-                    append_reasoning_text(&tx_event, &mut reasoning_item, text.to_string()).await;
-                } else if let Some(text) = reasoning.get("text").and_then(|v| v.as_str()) {
-                    append_reasoning_text(&tx_event, &mut reasoning_item, text.to_string()).await;
-                } else if let Some(text) = reasoning.get("content").and_then(|v| v.as_str()) {
-                    append_reasoning_text(&tx_event, &mut reasoning_item, text.to_string()).await;
+            if let Some(message) = choice.get("message") {
+                if let Some(reasoning) = message.get("reasoning")
+                    && let Some(text) = extract_reasoning_text(reasoning)
+                {
+                    append_reasoning_text(
+                        &tx_event,
+                        &mut reasoning_item,
+                        text,
+                        ReasoningSource::Reasoning,
+                    )
+                    .await;
                 }
+
+                if let Some(reasoning_content) = message.get("reasoning_content")
+                    && let Some(text) = extract_reasoning_text(reasoning_content)
+                {
+                    append_reasoning_text(
+                        &tx_event,
+                        &mut reasoning_item,
+                        text,
+                        ReasoningSource::ReasoningContent,
+                    )
+                    .await;
+                }
+
+                if let Some(reasoning_details) = message.get("reasoning_details") {
+                    append_reasoning_details(
+                        &tx_event,
+                        &mut reasoning_item,
+                        reasoning_details.clone(),
+                    )
+                    .await;
+                }
+            }
+
+            if let Some(reasoning_details) = choice.get("reasoning_details") {
+                append_reasoning_details(&tx_event, &mut reasoning_item, reasoning_details.clone())
+                    .await;
             }
 
             let finish_reason = choice.get("finish_reason").and_then(|r| r.as_str());
@@ -313,12 +362,15 @@ async fn append_reasoning_text(
     tx_event: &mpsc::Sender<Result<ResponseEvent, ApiError>>,
     reasoning_item: &mut Option<ResponseItem>,
     text: String,
+    source: ReasoningSource,
 ) {
     if reasoning_item.is_none() {
         let item = ResponseItem::Reasoning {
             id: String::new(),
             summary: Vec::new(),
             content: Some(vec![]),
+            reasoning_details: None,
+            reasoning_source: Some(source.clone()),
             encrypted_content: None,
         };
         *reasoning_item = Some(item.clone());
@@ -328,10 +380,13 @@ async fn append_reasoning_text(
     }
 
     if let Some(ResponseItem::Reasoning {
-        content: Some(content),
+        content,
+        reasoning_source,
         ..
     }) = reasoning_item
     {
+        update_reasoning_source(reasoning_source, source);
+        let content = content.get_or_insert_with(Vec::new);
         let content_index = content.len() as i64;
         content.push(ReasoningItemContent::ReasoningText { text: text.clone() });
 
@@ -341,6 +396,112 @@ async fn append_reasoning_text(
                 content_index,
             }))
             .await;
+    }
+}
+
+async fn append_reasoning_details(
+    tx_event: &mpsc::Sender<Result<ResponseEvent, ApiError>>,
+    reasoning_item: &mut Option<ResponseItem>,
+    details: serde_json::Value,
+) {
+    if reasoning_item.is_none() {
+        let item = ResponseItem::Reasoning {
+            id: String::new(),
+            summary: Vec::new(),
+            content: None,
+            reasoning_details: Some(details.clone()),
+            reasoning_source: Some(ReasoningSource::ReasoningDetails),
+            encrypted_content: None,
+        };
+        *reasoning_item = Some(item.clone());
+        let _ = tx_event
+            .send(Ok(ResponseEvent::OutputItemAdded(item)))
+            .await;
+    }
+
+    if let Some(ResponseItem::Reasoning {
+        reasoning_details,
+        reasoning_source,
+        ..
+    }) = reasoning_item
+    {
+        *reasoning_details = Some(details.clone());
+        update_reasoning_source(reasoning_source, ReasoningSource::ReasoningDetails);
+    }
+
+    if let Some(text) = extract_reasoning_text_from_details(&details)
+        && !text.trim().is_empty()
+    {
+        append_reasoning_text(
+            tx_event,
+            reasoning_item,
+            text,
+            ReasoningSource::ReasoningDetails,
+        )
+        .await;
+    }
+}
+
+fn extract_reasoning_text(value: &serde_json::Value) -> Option<String> {
+    if let Some(text) = value.as_str() {
+        return Some(text.to_string());
+    }
+    if let Some(text) = value.get("text").and_then(serde_json::Value::as_str) {
+        return Some(text.to_string());
+    }
+    value
+        .get("content")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
+fn extract_reasoning_text_from_details(details: &serde_json::Value) -> Option<String> {
+    match details {
+        serde_json::Value::String(text) => Some(text.clone()),
+        serde_json::Value::Array(items) => {
+            let mut combined = String::new();
+            for item in items {
+                if let Some(text) = item.as_str() {
+                    combined.push_str(text);
+                } else if let Some(text) = item.get("text").and_then(serde_json::Value::as_str) {
+                    combined.push_str(text);
+                } else if let Some(text) = item.get("content").and_then(serde_json::Value::as_str) {
+                    combined.push_str(text);
+                }
+            }
+            if combined.trim().is_empty() {
+                None
+            } else {
+                Some(combined)
+            }
+        }
+        serde_json::Value::Object(obj) => {
+            if let Some(text) = obj.get("text").and_then(serde_json::Value::as_str) {
+                return Some(text.to_string());
+            }
+            obj.get("content")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        }
+        _ => None,
+    }
+}
+
+fn update_reasoning_source(current: &mut Option<ReasoningSource>, incoming: ReasoningSource) {
+    let Some(existing) = current else {
+        *current = Some(incoming);
+        return;
+    };
+    if reasoning_source_rank(&incoming) > reasoning_source_rank(existing) {
+        *current = Some(incoming);
+    }
+}
+
+fn reasoning_source_rank(source: &ReasoningSource) -> u8 {
+    match source {
+        ReasoningSource::Reasoning => 0,
+        ReasoningSource::ReasoningContent => 1,
+        ReasoningSource::ReasoningDetails => 2,
     }
 }
 
@@ -665,5 +826,66 @@ mod tests {
             )
         }));
         assert_matches!(events.last(), Some(ResponseEvent::Completed { .. }));
+    }
+
+    #[tokio::test]
+    async fn streams_reasoning_content_delta() {
+        let delta_reasoning = json!({
+            "choices": [{
+                "delta": {
+                    "reasoning_content": "think-a"
+                }
+            }]
+        });
+
+        let finish = json!({
+            "choices": [{
+                "finish_reason": "stop"
+            }]
+        });
+
+        let body = build_body(&[delta_reasoning, finish]);
+        let events = collect_events(&body).await;
+
+        assert_matches!(
+            &events[..],
+            [
+                ResponseEvent::OutputItemAdded(ResponseItem::Reasoning { .. }),
+                ResponseEvent::ReasoningContentDelta { delta, .. },
+                ResponseEvent::OutputItemDone(ResponseItem::Reasoning { .. }),
+                ResponseEvent::Completed { .. }
+            ] if delta == "think-a"
+        );
+    }
+
+    #[tokio::test]
+    async fn preserves_reasoning_details_from_message() {
+        let message_details = json!({
+            "choices": [{
+                "message": {
+                    "reasoning_details": [{"text": "detail-a"}, {"text": "detail-b"}]
+                },
+                "finish_reason": "stop"
+            }]
+        });
+
+        let body = build_body(&[message_details]);
+        let events = collect_events(&body).await;
+
+        let details = match events.iter().find_map(|ev| match ev {
+            ResponseEvent::OutputItemDone(ResponseItem::Reasoning {
+                reasoning_details: Some(details),
+                ..
+            }) => Some(details),
+            _ => None,
+        }) {
+            Some(details) => details,
+            None => panic!("missing reasoning_details"),
+        };
+
+        assert_eq!(
+            details,
+            &json!([{"text": "detail-a"}, {"text": "detail-b"}])
+        );
     }
 }

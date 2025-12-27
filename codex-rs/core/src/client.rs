@@ -112,7 +112,8 @@ impl ModelClient {
     /// Completions wire API, depending on the configured provider.
     ///
     /// For Chat providers, the underlying stream is optionally aggregated
-    /// based on the `show_raw_agent_reasoning` flag in the config.
+    /// based on the `show_raw_agent_reasoning` flag in the config. Reasoning
+    /// controls for chat completions are governed by `enable_reasoning`.
     pub async fn stream(&self, prompt: &Prompt) -> Result<ResponseStream> {
         match self.provider.wire_api {
             WireApi::Responses => self.stream_responses_api(prompt).await,
@@ -169,6 +170,7 @@ impl ModelClient {
                 .stream_prompt(
                     &self.get_model(),
                     &api_prompt,
+                    self.config.enable_reasoning,
                     Some(conversation_id.clone()),
                     Some(session_source.clone()),
                 )

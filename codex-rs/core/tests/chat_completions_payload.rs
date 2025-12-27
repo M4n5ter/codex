@@ -16,11 +16,13 @@ use codex_core::models_manager::manager::ModelsManager;
 use codex_otel::otel_manager::OtelManager;
 use codex_protocol::ConversationId;
 use codex_protocol::models::ReasoningItemContent;
+use codex_protocol::models::ReasoningSource;
 use codex_protocol::protocol::SessionSource;
 use core_test_support::load_default_config_for_test;
 use core_test_support::skip_if_no_network;
 use futures::StreamExt;
 use serde_json::Value;
+use serde_json::json;
 use tempfile::TempDir;
 use wiremock::Mock;
 use wiremock::MockServer;
@@ -68,7 +70,7 @@ async fn run_request(input: Vec<ResponseItem>) -> Value {
     let mut config = load_default_config_for_test(&codex_home).await;
     config.model_provider_id = provider.name.clone();
     config.model_provider = provider.clone();
-    config.show_raw_agent_reasoning = true;
+    config.enable_reasoning = true;
     let effort = config.model_reasoning_effort;
     let summary = config.model_reasoning_summary;
     let config = Arc::new(config);
@@ -154,6 +156,32 @@ fn reasoning_item(text: &str) -> ResponseItem {
         content: Some(vec![ReasoningItemContent::ReasoningText {
             text: text.to_string(),
         }]),
+        reasoning_details: None,
+        reasoning_source: None,
+        encrypted_content: None,
+    }
+}
+
+fn reasoning_item_with_details(details: Value) -> ResponseItem {
+    ResponseItem::Reasoning {
+        id: String::new(),
+        summary: Vec::new(),
+        content: None,
+        reasoning_details: Some(details),
+        reasoning_source: Some(ReasoningSource::ReasoningDetails),
+        encrypted_content: None,
+    }
+}
+
+fn reasoning_item_with_source(text: &str, source: ReasoningSource) -> ResponseItem {
+    ResponseItem::Reasoning {
+        id: String::new(),
+        summary: Vec::new(),
+        content: Some(vec![ReasoningItemContent::ReasoningText {
+            text: text.to_string(),
+        }]),
+        reasoning_details: None,
+        reasoning_source: Some(source),
         encrypted_content: None,
     }
 }
@@ -327,4 +355,40 @@ async fn suppresses_duplicate_assistant_messages() {
         assistant_messages[0]["content"],
         Value::String("dup".into())
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attaches_reasoning_details_to_assistant() {
+    skip_if_no_network!();
+
+    let details = json!([{"text": "detail-a"}, {"text": "detail-b"}]);
+    let body = run_request(vec![
+        user_message("u1"),
+        assistant_message("a1"),
+        reasoning_item_with_details(details.clone()),
+    ])
+    .await;
+    let messages = messages_from(&body);
+    let assistant = first_assistant(&messages);
+
+    assert_eq!(assistant["reasoning_details"], details);
+    assert!(assistant.get("reasoning").is_none());
+    assert!(assistant.get("reasoning_content").is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attaches_reasoning_content_when_source_set() {
+    skip_if_no_network!();
+
+    let body = run_request(vec![
+        user_message("u1"),
+        assistant_message("a1"),
+        reasoning_item_with_source("rC", ReasoningSource::ReasoningContent),
+    ])
+    .await;
+    let messages = messages_from(&body);
+    let assistant = first_assistant(&messages);
+
+    assert_eq!(assistant["reasoning_content"], Value::String("rC".into()));
+    assert!(assistant.get("reasoning").is_none());
 }

@@ -262,6 +262,8 @@ mod tests {
             content: Some(vec![ReasoningItemContent::ReasoningText {
                 text: "raw details".to_string(),
             }]),
+            reasoning_details: None,
+            reasoning_source: None,
             encrypted_content: None,
         };
 
@@ -294,6 +296,8 @@ mod tests {
                     text: "final thought".to_string(),
                 },
             ]),
+            reasoning_details: None,
+            reasoning_source: None,
             encrypted_content: None,
         };
 

@@ -1163,6 +1163,8 @@ async fn azure_responses_request_includes_store_and_reasoning_ids() {
         content: Some(vec![ReasoningItemContent::ReasoningText {
             text: "content".into(),
         }]),
+        reasoning_details: None,
+        reasoning_source: None,
         encrypted_content: None,
     });
     prompt.input.push(ResponseItem::Message {

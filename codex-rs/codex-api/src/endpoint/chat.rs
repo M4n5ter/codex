@@ -13,6 +13,7 @@ use codex_client::HttpTransport;
 use codex_client::RequestTelemetry;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ReasoningItemContent;
+use codex_protocol::models::ReasoningSource;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::SessionSource;
 use futures::Stream;
@@ -53,16 +54,22 @@ impl<T: HttpTransport, A: AuthProvider> ChatClient<T, A> {
         &self,
         model: &str,
         prompt: &ApiPrompt,
+        enable_reasoning: bool,
         conversation_id: Option<String>,
         session_source: Option<SessionSource>,
     ) -> Result<ResponseStream, ApiError> {
         use crate::requests::ChatRequestBuilder;
 
-        let request =
-            ChatRequestBuilder::new(model, &prompt.instructions, &prompt.input, &prompt.tools)
-                .conversation_id(conversation_id)
-                .session_source(session_source)
-                .build(self.streaming.provider())?;
+        let request = ChatRequestBuilder::new(
+            model,
+            &prompt.instructions,
+            &prompt.input,
+            &prompt.tools,
+            enable_reasoning,
+        )
+        .conversation_id(conversation_id)
+        .session_source(session_source)
+        .build()?;
 
         self.stream_request(request).await
     }
@@ -96,6 +103,8 @@ pub struct AggregatedStream {
     inner: ResponseStream,
     cumulative: String,
     cumulative_reasoning: String,
+    reasoning_details: Option<Value>,
+    reasoning_source: Option<ReasoningSource>,
     pending: VecDeque<ResponseEvent>,
     mode: AggregateMode,
 }
@@ -116,6 +125,7 @@ impl Stream for AggregatedStream {
                 Poll::Ready(None) => return Poll::Ready(None),
                 Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
                 Poll::Ready(Some(Ok(ResponseEvent::OutputItemDone(item)))) => {
+                    this.capture_reasoning_metadata(&item);
                     let is_assistant_message = matches!(
                         &item,
                         ResponseItem::Message { role, .. } if role == "assistant"
@@ -158,13 +168,24 @@ impl Stream for AggregatedStream {
                 }))) => {
                     let mut emitted_any = false;
 
-                    if !this.cumulative_reasoning.is_empty() {
+                    let has_reasoning =
+                        !this.cumulative_reasoning.is_empty() || this.reasoning_details.is_some();
+                    if has_reasoning {
+                        let reasoning_details = this.reasoning_details.take();
+                        let reasoning_source = this.reasoning_source.take();
+                        let content = if this.cumulative_reasoning.is_empty() {
+                            None
+                        } else {
+                            Some(vec![ReasoningItemContent::ReasoningText {
+                                text: std::mem::take(&mut this.cumulative_reasoning),
+                            }])
+                        };
                         let aggregated_reasoning = ResponseItem::Reasoning {
                             id: String::new(),
                             summary: Vec::new(),
-                            content: Some(vec![ReasoningItemContent::ReasoningText {
-                                text: std::mem::take(&mut this.cumulative_reasoning),
-                            }]),
+                            content,
+                            reasoning_details,
+                            reasoning_source,
                             encrypted_content: None,
                         };
                         this.pending
@@ -230,6 +251,7 @@ impl Stream for AggregatedStream {
                     continue;
                 }
                 Poll::Ready(Some(Ok(ResponseEvent::OutputItemAdded(item)))) => {
+                    this.capture_reasoning_metadata(&item);
                     return Poll::Ready(Some(Ok(ResponseEvent::OutputItemAdded(item))));
                 }
             }
@@ -259,8 +281,111 @@ impl AggregatedStream {
             inner,
             cumulative: String::new(),
             cumulative_reasoning: String::new(),
+            reasoning_details: None,
+            reasoning_source: None,
             pending: VecDeque::new(),
             mode,
         }
+    }
+
+    fn capture_reasoning_metadata(&mut self, item: &ResponseItem) {
+        let ResponseItem::Reasoning {
+            reasoning_details,
+            reasoning_source,
+            ..
+        } = item
+        else {
+            return;
+        };
+
+        if reasoning_details.is_some() {
+            self.reasoning_details = reasoning_details.clone();
+        }
+
+        if let Some(source) = reasoning_source {
+            let replace = match &self.reasoning_source {
+                None => true,
+                Some(existing) => reasoning_source_rank(source) > reasoning_source_rank(existing),
+            };
+            if replace {
+                self.reasoning_source = Some(source.clone());
+            }
+        }
+    }
+}
+
+fn reasoning_source_rank(source: &ReasoningSource) -> u8 {
+    match source {
+        ReasoningSource::Reasoning => 0,
+        ReasoningSource::ReasoningContent => 1,
+        ReasoningSource::ReasoningDetails => 2,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::StreamExt;
+    use serde_json::json;
+    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn aggregated_stream_preserves_reasoning_metadata() {
+        let (tx, rx) = mpsc::channel(8);
+        let stream = ResponseStream { rx_event: rx };
+        let mut stream = stream.aggregate();
+
+        let details = json!([{"text": "detail"}]);
+        let reasoning_item = ResponseItem::Reasoning {
+            id: String::new(),
+            summary: Vec::new(),
+            content: None,
+            reasoning_details: Some(details.clone()),
+            reasoning_source: Some(ReasoningSource::ReasoningDetails),
+            encrypted_content: None,
+        };
+
+        tx.send(Ok(ResponseEvent::OutputItemAdded(reasoning_item)))
+            .await
+            .expect("send reasoning item");
+        tx.send(Ok(ResponseEvent::ReasoningContentDelta {
+            delta: "think".to_string(),
+            content_index: 0,
+        }))
+        .await
+        .expect("send reasoning delta");
+        tx.send(Ok(ResponseEvent::Completed {
+            response_id: "resp-1".to_string(),
+            token_usage: None,
+        }))
+        .await
+        .expect("send completed");
+        drop(tx);
+
+        let mut done_reasoning = None;
+        while let Some(ev) = stream.next().await {
+            let ev = ev.expect("event");
+            if let ResponseEvent::OutputItemDone(ResponseItem::Reasoning {
+                reasoning_details,
+                reasoning_source,
+                content,
+                ..
+            }) = ev
+            {
+                done_reasoning = Some((reasoning_details, reasoning_source, content));
+                break;
+            }
+        }
+
+        let (reasoning_details, reasoning_source, content) =
+            done_reasoning.expect("reasoning done");
+        assert_eq!(reasoning_details, Some(details));
+        assert_eq!(reasoning_source, Some(ReasoningSource::ReasoningDetails));
+        assert_eq!(
+            content,
+            Some(vec![ReasoningItemContent::ReasoningText {
+                text: "think".to_string()
+            }])
+        );
     }
 }

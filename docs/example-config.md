@@ -139,6 +139,9 @@ notifications = false
 # Enables welcome/status/spinner animations. Default: true
 animations = true
 
+# Enable provider-specific reasoning controls for Chat Completions. Default: false
+enable_reasoning = false
+
 # Suppress internal reasoning events from output. Default: false
 hide_agent_reasoning = false
 

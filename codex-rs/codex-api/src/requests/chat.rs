@@ -1,11 +1,11 @@
 use crate::error::ApiError;
-use crate::provider::Provider;
 use crate::requests::headers::build_conversation_headers;
 use crate::requests::headers::insert_header;
 use crate::requests::headers::subagent_header;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::ReasoningItemContent;
+use codex_protocol::models::ReasoningSource;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::SessionSource;
 use http::HeaderMap;
@@ -24,8 +24,16 @@ pub struct ChatRequestBuilder<'a> {
     instructions: &'a str,
     input: &'a [ResponseItem],
     tools: &'a [Value],
+    enable_reasoning: bool,
     conversation_id: Option<String>,
     session_source: Option<SessionSource>,
+}
+
+#[derive(Clone, Default)]
+struct ReasoningAttachment {
+    text: String,
+    details: Option<Value>,
+    source: Option<ReasoningSource>,
 }
 
 impl<'a> ChatRequestBuilder<'a> {
@@ -34,12 +42,14 @@ impl<'a> ChatRequestBuilder<'a> {
         instructions: &'a str,
         input: &'a [ResponseItem],
         tools: &'a [Value],
+        enable_reasoning: bool,
     ) -> Self {
         Self {
             model,
             instructions,
             input,
             tools,
+            enable_reasoning,
             conversation_id: None,
             session_source: None,
         }
@@ -55,12 +65,12 @@ impl<'a> ChatRequestBuilder<'a> {
         self
     }
 
-    pub fn build(self, _provider: &Provider) -> Result<ChatRequest, ApiError> {
+    pub fn build(self) -> Result<ChatRequest, ApiError> {
         let mut messages = Vec::<Value>::new();
         messages.push(json!({"role": "system", "content": self.instructions}));
 
         let input = self.input;
-        let mut reasoning_by_anchor_index: HashMap<usize, String> = HashMap::new();
+        let mut reasoning_by_anchor_index: HashMap<usize, ReasoningAttachment> = HashMap::new();
         let mut last_emitted_role: Option<&str> = None;
         for item in input {
             match item {
@@ -96,23 +106,36 @@ impl<'a> ChatRequestBuilder<'a> {
                 }
 
                 if let ResponseItem::Reasoning {
-                    content: Some(items),
+                    content,
+                    reasoning_details,
+                    reasoning_source,
                     ..
                 } = item
                 {
                     let mut text = String::new();
-                    for entry in items {
-                        match entry {
-                            ReasoningItemContent::ReasoningText { text: segment }
-                            | ReasoningItemContent::Text { text: segment } => {
-                                text.push_str(segment)
+                    if let Some(items) = content {
+                        for entry in items {
+                            match entry {
+                                ReasoningItemContent::ReasoningText { text: segment }
+                                | ReasoningItemContent::Text { text: segment } => {
+                                    text.push_str(segment)
+                                }
                             }
                         }
                     }
-                    if text.trim().is_empty() {
+                    if text.trim().is_empty() && reasoning_details.is_none() {
                         continue;
                     }
 
+                    let attachment = ReasoningAttachment {
+                        text,
+                        details: reasoning_details.clone(),
+                        source: reasoning_source.clone().or_else(|| {
+                            reasoning_details
+                                .as_ref()
+                                .map(|_| ReasoningSource::ReasoningDetails)
+                        }),
+                    };
                     let mut attached = false;
                     if idx > 0
                         && let ResponseItem::Message { role, .. } = &input[idx - 1]
@@ -120,8 +143,10 @@ impl<'a> ChatRequestBuilder<'a> {
                     {
                         reasoning_by_anchor_index
                             .entry(idx - 1)
-                            .and_modify(|v| v.push_str(&text))
-                            .or_insert(text.clone());
+                            .and_modify(|existing| {
+                                merge_reasoning_attachment(existing, &attachment);
+                            })
+                            .or_insert(attachment.clone());
                         attached = true;
                     }
 
@@ -131,14 +156,18 @@ impl<'a> ChatRequestBuilder<'a> {
                             | ResponseItem::LocalShellCall { .. } => {
                                 reasoning_by_anchor_index
                                     .entry(idx + 1)
-                                    .and_modify(|v| v.push_str(&text))
-                                    .or_insert(text.clone());
+                                    .and_modify(|existing| {
+                                        merge_reasoning_attachment(existing, &attachment);
+                                    })
+                                    .or_insert(attachment.clone());
                             }
                             ResponseItem::Message { role, .. } if role == "assistant" => {
                                 reasoning_by_anchor_index
                                     .entry(idx + 1)
-                                    .and_modify(|v| v.push_str(&text))
-                                    .or_insert(text.clone());
+                                    .and_modify(|existing| {
+                                        merge_reasoning_attachment(existing, &attachment);
+                                    })
+                                    .or_insert(attachment.clone());
                             }
                             _ => {}
                         }
@@ -194,7 +223,7 @@ impl<'a> ChatRequestBuilder<'a> {
                         && let Some(reasoning) = reasoning_by_anchor_index.get(&idx)
                         && let Some(obj) = msg.as_object_mut()
                     {
-                        obj.insert("reasoning".to_string(), json!(reasoning));
+                        attach_reasoning_fields(obj, reasoning);
                     }
                     messages.push(msg);
                 }
@@ -219,7 +248,7 @@ impl<'a> ChatRequestBuilder<'a> {
                     if let Some(reasoning) = reasoning_by_anchor_index.get(&idx)
                         && let Some(obj) = msg.as_object_mut()
                     {
-                        obj.insert("reasoning".to_string(), json!(reasoning));
+                        attach_reasoning_fields(obj, reasoning);
                     }
                     messages.push(msg);
                 }
@@ -242,7 +271,7 @@ impl<'a> ChatRequestBuilder<'a> {
                     if let Some(reasoning) = reasoning_by_anchor_index.get(&idx)
                         && let Some(obj) = msg.as_object_mut()
                     {
-                        obj.insert("reasoning".to_string(), json!(reasoning));
+                        attach_reasoning_fields(obj, reasoning);
                     }
                     messages.push(msg);
                 }
@@ -316,6 +345,12 @@ impl<'a> ChatRequestBuilder<'a> {
             "tools": self.tools,
         });
 
+        let payload = if self.enable_reasoning {
+            attach_reasoning_controls(payload)
+        } else {
+            payload
+        };
+
         let mut headers = build_conversation_headers(self.conversation_id);
         if let Some(subagent) = subagent_header(&self.session_source) {
             insert_header(&mut headers, "x-openai-subagent", &subagent);
@@ -328,34 +363,88 @@ impl<'a> ChatRequestBuilder<'a> {
     }
 }
 
+fn merge_reasoning_attachment(target: &mut ReasoningAttachment, incoming: &ReasoningAttachment) {
+    if !incoming.text.is_empty() {
+        target.text.push_str(&incoming.text);
+    }
+    if incoming.details.is_some() {
+        target.details = incoming.details.clone();
+    }
+    merge_reasoning_source(&mut target.source, incoming.source.clone());
+}
+
+fn merge_reasoning_source(target: &mut Option<ReasoningSource>, incoming: Option<ReasoningSource>) {
+    let Some(incoming) = incoming else {
+        return;
+    };
+    let replace = match target {
+        None => true,
+        Some(existing) => reasoning_source_rank(&incoming) > reasoning_source_rank(existing),
+    };
+    if replace {
+        *target = Some(incoming);
+    }
+}
+
+fn reasoning_source_rank(source: &ReasoningSource) -> u8 {
+    match source {
+        ReasoningSource::Reasoning => 0,
+        ReasoningSource::ReasoningContent => 1,
+        ReasoningSource::ReasoningDetails => 2,
+    }
+}
+
+fn attach_reasoning_fields(
+    obj: &mut serde_json::Map<String, Value>,
+    reasoning: &ReasoningAttachment,
+) {
+    if let Some(details) = &reasoning.details {
+        obj.insert("reasoning_details".to_string(), details.clone());
+        return;
+    }
+
+    if reasoning.text.trim().is_empty() {
+        return;
+    }
+
+    let field = match reasoning.source {
+        Some(ReasoningSource::ReasoningContent) => "reasoning_content",
+        _ => "reasoning",
+    };
+    obj.insert(field.to_string(), json!(reasoning.text));
+}
+
+fn attach_reasoning_controls(mut payload: Value) -> Value {
+    let Some(obj) = payload.as_object_mut() else {
+        return payload;
+    };
+
+    obj.insert("reasoning".to_string(), json!({ "enabled": true }));
+    obj.insert("reasoning_split".to_string(), json!(true));
+    obj.insert(
+        "thinking".to_string(),
+        json!({
+            "type": "enabled",
+            "clear_thinking": false,
+        }),
+    );
+    obj.insert(
+        "chat_template_kwargs".to_string(),
+        json!({
+            "thinking": true,
+        }),
+    );
+
+    payload
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::RetryConfig;
-    use crate::provider::WireApi;
     use codex_protocol::protocol::SessionSource;
     use codex_protocol::protocol::SubAgentSource;
     use http::HeaderValue;
     use pretty_assertions::assert_eq;
-    use std::time::Duration;
-
-    fn provider() -> Provider {
-        Provider {
-            name: "openai".to_string(),
-            base_url: "https://api.openai.com/v1".to_string(),
-            query_params: None,
-            wire: WireApi::Chat,
-            headers: HeaderMap::new(),
-            retry: RetryConfig {
-                max_attempts: 1,
-                base_delay: Duration::from_millis(10),
-                retry_429: false,
-                retry_5xx: true,
-                retry_transport: true,
-            },
-            stream_idle_timeout: Duration::from_secs(1),
-        }
-    }
 
     #[test]
     fn attaches_conversation_and_subagent_headers() {
@@ -366,10 +455,10 @@ mod tests {
                 text: "hi".to_string(),
             }],
         }];
-        let req = ChatRequestBuilder::new("gpt-test", "inst", &prompt_input, &[])
+        let req = ChatRequestBuilder::new("gpt-test", "inst", &prompt_input, &[], false)
             .conversation_id(Some("conv-1".into()))
             .session_source(Some(SessionSource::SubAgent(SubAgentSource::Review)))
-            .build(&provider())
+            .build()
             .expect("request");
 
         assert_eq!(
@@ -383,6 +472,32 @@ mod tests {
         assert_eq!(
             req.headers.get("x-openai-subagent"),
             Some(&HeaderValue::from_static("review"))
+        );
+    }
+
+    #[test]
+    fn enables_reasoning_controls() {
+        let prompt_input = vec![ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "hi".to_string(),
+            }],
+        }];
+        let req = ChatRequestBuilder::new("gpt-test", "inst", &prompt_input, &[], true)
+            .build()
+            .expect("request");
+
+        assert_eq!(req.body["reasoning"]["enabled"], Value::Bool(true));
+        assert_eq!(req.body["reasoning_split"], Value::Bool(true));
+        assert_eq!(
+            req.body["thinking"]["type"],
+            Value::String("enabled".into())
+        );
+        assert_eq!(req.body["thinking"]["clear_thinking"], Value::Bool(false));
+        assert_eq!(
+            req.body["chat_template_kwargs"]["thinking"],
+            Value::Bool(true)
         );
     }
 }

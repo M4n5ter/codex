@@ -761,6 +761,16 @@ Setting `hide_agent_reasoning` to `true` suppresses these events in **both** the
 hide_agent_reasoning = true   # defaults to false
 ```
 
+### enable_reasoning
+
+Enables provider-specific reasoning controls for Chat Completions requests. This only affects outbound API calls; it does **not** change how reasoning is displayed in the UI.
+
+Example:
+
+```toml
+enable_reasoning = true  # defaults to false
+```
+
 ### show_raw_agent_reasoning
 
 Surfaces the model’s raw chain-of-thought ("raw reasoning content") when available.
@@ -769,6 +779,7 @@ Notes:
 
 - Only takes effect if the selected model/provider actually emits raw reasoning content. Many models do not. When unsupported, this option has no visible effect.
 - Raw reasoning may include intermediate thoughts or sensitive context. Enable only if acceptable for your workflow.
+- This flag only affects display. To request reasoning on Chat Completions, set `enable_reasoning = true`.
 
 Example:
 
@@ -1055,6 +1066,7 @@ Valid values:
 | `tui.scroll_invert`                              | boolean                                                           | Invert mouse scroll direction in TUI2 (default: false).                                                                         |
 | `hide_agent_reasoning`                           | boolean                                                           | Hide model reasoning events.                                                                                                    |
 | `check_for_update_on_startup`                    | boolean                                                           | Check for Codex updates on startup (default: true). Set to `false` only if updates are centrally managed.                       |
+| `enable_reasoning`                               | boolean                                                           | Enable provider-specific reasoning controls for Chat Completions requests.                                                      |
 | `show_raw_agent_reasoning`                       | boolean                                                           | Show raw reasoning (when available).                                                                                            |
 | `model_reasoning_effort`                         | `minimal` \| `low` \| `medium` \| `high`\|`xhigh`                 | Responses API reasoning effort.                                                                                                 |
 | `model_reasoning_summary`                        | `auto` \| `concise` \| `detailed` \| `none`                       | Reasoning summaries.                                                                                                            |

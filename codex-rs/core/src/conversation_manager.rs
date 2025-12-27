@@ -341,6 +341,8 @@ mod tests {
                     text: "s".to_string(),
                 }],
                 content: None,
+                reasoning_details: None,
+                reasoning_source: None,
                 encrypted_content: None,
             },
             ResponseItem::FunctionCall {

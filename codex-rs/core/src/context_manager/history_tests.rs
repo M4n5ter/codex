@@ -52,6 +52,8 @@ fn reasoning_msg(text: &str) -> ResponseItem {
         content: Some(vec![ReasoningItemContent::ReasoningText {
             text: text.to_string(),
         }]),
+        reasoning_details: None,
+        reasoning_source: None,
         encrypted_content: None,
     }
 }
@@ -63,6 +65,8 @@ fn reasoning_with_encrypted_content(len: usize) -> ResponseItem {
             text: "summary".to_string(),
         }],
         content: None,
+        reasoning_details: None,
+        reasoning_source: None,
         encrypted_content: Some("a".repeat(len)),
     }
 }
@@ -103,6 +107,8 @@ fn filters_non_api_messages() {
                 content: Some(vec![ReasoningItemContent::ReasoningText {
                     text: "thinking...".to_string(),
                 }]),
+                reasoning_details: None,
+                reasoning_source: None,
                 encrypted_content: None,
             },
             ResponseItem::Message {
